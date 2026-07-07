@@ -147,12 +147,24 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     effectivePriority: entry.priority + getPenalty(entry.model_db_id),
   })).sort((a, b) => a.effectivePriority - b.effectivePriority);
 
-  // Sticky session: move preferred model to front of chain
+  // Sticky session / explicit pin: move preferred model to front of chain.
+  // A model can be enabled in the catalogue without being in the curated
+  // fallback_config (e.g. added by /api/catalogue/sync). An explicit request
+  // for it must still be honored - prepend a synthetic chain entry instead of
+  // silently auto-routing to a different model (which broke the proxy.ts
+  // "explicit model pins routing" contract for every synced model).
   if (preferredModelDbId) {
     const idx = sortedChain.findIndex(e => e.model_db_id === preferredModelDbId);
     if (idx > 0) {
       const [preferred] = sortedChain.splice(idx, 1);
       sortedChain.unshift(preferred);
+    } else if (idx === -1) {
+      sortedChain.unshift({
+        model_db_id: preferredModelDbId,
+        priority: -1,
+        enabled: 1,
+        effectivePriority: -1,
+      });
     }
   }
 
