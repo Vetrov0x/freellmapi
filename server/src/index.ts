@@ -4,14 +4,20 @@ import { initDb } from './db/index.js';
 import { startHealthChecker } from './services/health.js';
 
 const PORT = process.env.PORT ?? 3001;
+// Bind loopback by default (Q-325 hardening): this is a single-user LOCAL proxy;
+// every legit consumer (responses-shim, economy-loop, substrate-*) already calls
+// http://127.0.0.1:3001. Binding 0.0.0.0 exposed /api/keys mutation to the fleet
+// overlays (AWG 10.0.0.2 + Tailscale). Override with HOST= only for a deliberate,
+// authenticated public deployment (unsupported — see README).
+const HOST = process.env.HOST ?? '127.0.0.1';
 
 async function main() {
   initDb();
   const app = createApp();
 
-  app.listen(Number(PORT), '0.0.0.0', () => {
-    console.log(`Server running on http://0.0.0.0:${PORT}`);
-    console.log(`Proxy endpoint: http://0.0.0.0:${PORT}/v1/chat/completions`);
+  app.listen(Number(PORT), HOST, () => {
+    console.log(`Server running on http://${HOST}:${PORT}`);
+    console.log(`Proxy endpoint: http://${HOST}:${PORT}/v1/chat/completions`);
     startHealthChecker();
   });
 }
