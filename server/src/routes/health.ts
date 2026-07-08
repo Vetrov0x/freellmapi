@@ -3,6 +3,7 @@ import type { Request, Response } from 'express';
 import { getDb } from '../db/index.js';
 import { checkKeyHealth, checkAllKeys } from '../services/health.js';
 import { hasProvider } from '../providers/index.js';
+import { getStrongTierLiveness } from '../services/router.js';
 
 export const healthRouter = Router();
 
@@ -70,4 +71,10 @@ healthRouter.post('/check/:keyId', async (req: Request, res: Response) => {
 healthRouter.post('/check-all', async (_req: Request, res: Response) => {
   await checkAllKeys();
   res.json({ success: true });
+});
+
+// Strong-tier liveness feed (Galatea Brain-city widget): which strong pin is servable NOW.
+healthRouter.get('/strong-tier', (_req: Request, res: Response) => {
+  const tier = getStrongTierLiveness();
+  res.json({ tier, liveCount: tier.filter(t => t.live).length, total: tier.length });
 });

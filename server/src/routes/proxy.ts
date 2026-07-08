@@ -3,7 +3,7 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import type { ChatMessage } from '@freellmapi/shared/types.js';
-import { routeRequest, recordRateLimitHit, recordSuccess, type RouteResult } from '../services/router.js';
+import { routeRequest, recordRateLimitHit, recordSuccess, STRONG_TIER, type RouteResult } from '../services/router.js';
 import { recordRequest, recordTokens, setCooldown } from '../services/ratelimit.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
 import { contentToString } from '../lib/content.js';
@@ -15,6 +15,10 @@ export const proxyRouter = Router();
 // Requesting this id means "let the router decide" — identical to omitting
 // `model` entirely.
 const AUTO_MODEL_ID = 'auto';
+
+function isStrongTier(m: string | undefined): boolean {
+  return typeof m === 'string' && (m === 'strong-auto' || m.toLowerCase() === 'strong-tier');
+}
 
 function isAutoModel(modelId: string | undefined): boolean {
   return modelId === AUTO_MODEL_ID;
@@ -297,8 +301,24 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // matching the requested id, return 400 — silently auto-routing to a
   // different model would be surprising to OpenAI-compatible clients.
   // Sticky-session is the fallback when no `model` field was sent at all.
+  // Honest pinning: X-Model-Pin: strict forbids silent substitution (experiment mode).
+  const strictPin = String(req.headers['x-model-pin'] ?? '').toLowerCase() === 'strict';
   let preferredModel: number | undefined;
-  if (isAutoModel(requestedModel)) {
+  let allowedModelDbIds: Set<number> | undefined;
+  if (isStrongTier(requestedModel)) {
+    // strong-tier alias: route within the curated strong set only (never a weak model).
+    const tdb = getDb();
+    const ids = new Set<number>();
+    for (const s of STRONG_TIER) {
+      const row = tdb.prepare('SELECT id FROM models WHERE platform = ? AND model_id = ? AND enabled = 1').get(s.platform, s.modelId) as { id: number } | undefined;
+      if (row) ids.add(row.id);
+    }
+    if (ids.size === 0) {
+      res.status(503).json({ error: { message: 'strong-tier: no strong model catalogued/enabled', type: 'routing_error' } });
+      return;
+    }
+    allowedModelDbIds = ids;
+  } else if (isAutoModel(requestedModel)) {
     // Explicit "auto" → behave exactly like an omitted model field.
     preferredModel = getStickyModel(messages);
   } else if (requestedModel) {
@@ -329,7 +349,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     let route: RouteResult;
     try {
-      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel);
+      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, strictPin, allowedModelDbIds);
     } catch (err: any) {
       // No more models available
       if (lastError) {

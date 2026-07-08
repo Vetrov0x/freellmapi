@@ -131,7 +131,7 @@ export function getAllPenalties(): Array<{ modelDbId: number; count: number; pen
  * @param skipKeys - set of "platform:modelId:keyId" to skip (failed on this request)
  * @param preferredModelDbId - try this model first (sticky session)
  */
-export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number): RouteResult {
+export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, strictPin = false, allowedModelDbIds?: Set<number>): RouteResult {
   const db = getDb();
 
   // Get fallback chain ordered by priority
@@ -168,7 +168,17 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     }
   }
 
-  for (const entry of sortedChain) {
+  // Strict pin (X-Model-Pin: strict): restrict routing to ONLY the pinned model, so an
+  // unavailable pin errors honestly instead of silently substituting a different model.
+  let chain = (strictPin && preferredModelDbId)
+    ? sortedChain.filter(e => e.model_db_id === preferredModelDbId)
+    : sortedChain;
+  // Strong-tier: fallback restricted to a curated strong set — never a weak model.
+  if (allowedModelDbIds && allowedModelDbIds.size > 0) {
+    chain = chain.filter(e => allowedModelDbIds.has(e.model_db_id));
+  }
+
+  for (const entry of chain) {
     if (!entry.enabled) continue;
 
     // Get model details
@@ -235,7 +245,45 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     // in the `sortedChain` for THIS specific request.
   }
 
+  if (strictPin && preferredModelDbId) {
+    const pinErr = new Error(`Strict pin: model (db id ${preferredModelDbId}) is unavailable (rate-limited, on cooldown, or no healthy key). Substitution is forbidden — retry later or drop the X-Model-Pin header to allow fallback.`) as any;
+    pinErr.status = 503;
+    throw pinErr;
+  }
+  if (allowedModelDbIds && allowedModelDbIds.size > 0) {
+    const tierErr = new Error(`strong-tier: all ${allowedModelDbIds.size} strong models are unavailable (rate-limited / cooldown / no key). No weak-model substitution.`) as any;
+    tierErr.status = 503;
+    throw tierErr;
+  }
   const err = new Error('All models exhausted. Add more API keys or wait for rate limits to reset.') as any;
   err.status = 429;
   throw err;
+}
+
+
+// ── Strong-tier: curated strong FREE models. Fallback stays WITHIN this set (never a weak model). ──
+export const STRONG_TIER: { platform: string; modelId: string }[] = [
+  { platform: 'mistral', modelId: 'mistral-large-latest' },
+  { platform: 'groq',    modelId: 'llama-3.3-70b-versatile' },
+  { platform: 'nvidia',  modelId: 'meta/llama-3.1-70b-instruct' },
+  { platform: 'google',  modelId: 'gemma-4-31b-it' },
+  { platform: 'google',  modelId: 'gemini-3-flash-preview' },
+];
+
+// Which strong pin is servable NOW (reuses the router's own cooldown/rate checks — no token spend).
+export function getStrongTierLiveness(): { platform: string; model: string; live: boolean; reason: string }[] {
+  const db = getDb();
+  return STRONG_TIER.map(({ platform, modelId }) => {
+    const model = db.prepare('SELECT * FROM models WHERE platform = ? AND model_id = ? AND enabled = 1').get(platform, modelId) as ModelRow | undefined;
+    if (!model) return { platform, model: modelId, live: false, reason: 'not-catalogued' };
+    const keys = db.prepare("SELECT * FROM api_keys WHERE platform = ? AND enabled = 1 AND status != 'invalid'").all(platform) as KeyRow[];
+    if (keys.length === 0) return { platform, model: modelId, live: false, reason: 'no-key' };
+    const limits = { rpm: model.rpm_limit, rpd: model.rpd_limit, tpm: model.tpm_limit, tpd: model.tpd_limit };
+    for (const key of keys) {
+      if (isOnCooldown(model.platform, model.model_id, key.id)) continue;
+      if (!canMakeRequest(model.platform, model.model_id, key.id, limits)) continue;
+      return { platform, model: modelId, live: true, reason: 'ok' };
+    }
+    return { platform, model: modelId, live: false, reason: 'cooldown/rate' };
+  });
 }
