@@ -9,25 +9,45 @@ import { getProvider } from '../providers/index.js';
 // leave dead ids in our catalogue (cerebras 404 x168/day) and live ones missing
 // (google gemma-3-27b-it, 14400 rpd, absent). One mechanism for every platform.
 //
-// Policy (Дозор autonomy law): NOT on a timer. Invoked explicitly (operator or
-// a ratified runbook step). GET /diff is read-only; POST /sync mutates:
-//   - live upstream, missing here      -> INSERT (enabled, bottom rank)
-//   - in catalogue, gone upstream      -> UPDATE enabled=0 (never DELETE)
-//   - present both sides               -> untouched (manual limits preserved)
+// Policy (Дозор autonomy law): the CATALOGUE IS IVAN-GATED. This route NEVER
+// mutates unless the caller passes ?apply=true. `apply=false` (the DEFAULT)
+// returns the diff and changes nothing — it is a PROPOSAL only. GET /diff is
+// likewise read-only. Classification per operator brief:
+//   - ADD   : live upstream (chat-capable), missing here      -> INSERT (bottom rank)
+//   - PRUNE : in catalogue, absent from provider's live list  -> UPDATE enabled=0 (never DELETE)
+//   - KEEP  : present both sides                              -> untouched (manual limits preserved)
+//
+// Security: the provider key is decrypted in-process and used only to sign the
+// upstream request. It is never logged, returned, or embedded in an error
+// message (google's key rides in the query string, so errors surface only the
+// HTTP status, never the URL).
 
 export const catalogueRouter = Router();
 
 const GOOGLE_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 
-async function listLiveModelIds(platform: string, apiKey: string): Promise<string[]> {
+interface LiveModels {
+  // chat-routable ids (google: supports generateContent; openai-compat: all) —
+  // the ADD candidate set, so we never add image/tts/music rows as chat routes.
+  chatIds: string[];
+  // every id the provider lists, regardless of modality — the PRESENCE set used
+  // for PRUNE, so a live-but-non-chat model (google image/tts) is never falsely
+  // flagged dead, and only genuinely-removed ids prune.
+  allIds: string[];
+}
+
+async function listLiveModels(platform: string, apiKey: string): Promise<LiveModels> {
   if (platform === 'google') {
-    // AI Studio: paginated, filter to text-generation models
-    const ids: string[] = [];
+    // AI Studio ListModels: paginated. Collect ALL names for presence, and the
+    // generateContent subset for chat-add candidates.
+    const chatIds: string[] = [];
+    const allIds: string[] = [];
     let pageToken = '';
-    for (let page = 0; page < 10; page++) {
+    for (let page = 0; page < 20; page++) {
       const url = `${GOOGLE_BASE}/models?pageSize=200&key=${apiKey}` +
         (pageToken ? `&pageToken=${pageToken}` : '');
       const res = await fetch(url);
+      // Never include the URL (carries the key) in the thrown message.
       if (!res.ok) throw new Error(`google /models HTTP ${res.status}`);
       const data = await res.json() as {
         models?: { name?: string; supportedGenerationMethods?: string[] }[];
@@ -35,15 +55,19 @@ async function listLiveModelIds(platform: string, apiKey: string): Promise<strin
       };
       for (const m of data.models ?? []) {
         if (!m.name) continue;
-        if (!(m.supportedGenerationMethods ?? []).includes('generateContent')) continue;
-        ids.push(m.name.replace(/^models\//, ''));
+        const id = m.name.replace(/^models\//, '');
+        allIds.push(id);
+        if ((m.supportedGenerationMethods ?? []).includes('generateContent')) {
+          chatIds.push(id);
+        }
       }
       if (!data.nextPageToken) break;
       pageToken = data.nextPageToken;
     }
-    return ids;
+    return { chatIds, allIds };
   }
-  // OpenAI-compatible platforms: {baseUrl}/models with Bearer
+  // OpenAI-compatible platforms (cerebras, groq, sambanova, ...): {baseUrl}/models
+  // with Bearer. No modality distinction — the whole list is chat-routable.
   const provider = getProvider(platform as never) as unknown as { baseUrl?: string } | undefined;
   const baseUrl = provider?.baseUrl;
   if (!baseUrl) throw new Error(`platform '${platform}' has no listable provider baseUrl`);
@@ -52,7 +76,8 @@ async function listLiveModelIds(platform: string, apiKey: string): Promise<strin
   });
   if (!res.ok) throw new Error(`${platform} /models HTTP ${res.status}`);
   const data = await res.json() as { data?: { id?: string }[] };
-  return (data.data ?? []).map(m => m.id).filter((x): x is string => Boolean(x));
+  const ids = (data.data ?? []).map(m => m.id).filter((x): x is string => Boolean(x));
+  return { chatIds: ids, allIds: ids };
 }
 
 function getDecryptedKey(platform: string): string {
@@ -67,7 +92,14 @@ function getDecryptedKey(platform: string): string {
 
 interface CatalogueDiff {
   platform: string;
-  live_count: number;
+  live_count: number;   // chat-routable models the provider serves live
+  live_total: number;   // all models the provider lists (presence set)
+  // Brief classification (ADD / PRUNE / KEEP):
+  add: string[];                                   // live & chat-routable, not catalogued
+  prune: string[];                                 // catalogued but absent upstream (dead ids)
+  prune_active: string[];                          // subset of prune currently enabled=1 (what apply would newly disable)
+  keep: number;                                    // catalogued & present upstream
+  // Back-compat aliases (kept for any existing caller of GET /diff):
   to_add: string[];
   to_disable: string[];
   unchanged: number;
@@ -75,23 +107,37 @@ interface CatalogueDiff {
 
 async function computeDiff(platform: string): Promise<CatalogueDiff> {
   const apiKey = getDecryptedKey(platform);
-  const live = await listLiveModelIds(platform, apiKey);
-  const liveSet = new Set(live);
+  const { chatIds, allIds } = await listLiveModels(platform, apiKey);
+  const chatSet = new Set(chatIds);
+  const allSet = new Set(allIds);
   const db = getDb();
   const rows = db.prepare(
     'SELECT model_id, enabled FROM models WHERE platform = ?',
   ).all(platform) as { model_id: string; enabled: number }[];
   const known = new Set(rows.map(r => r.model_id));
+
+  const add = chatIds.filter(id => !known.has(id));
+  const pruneRows = rows.filter(r => !allSet.has(r.model_id)); // absent upstream = dead, regardless of enabled
+  const prune = pruneRows.map(r => r.model_id);
+  const prune_active = pruneRows.filter(r => r.enabled === 1).map(r => r.model_id);
+  const keep = rows.filter(r => allSet.has(r.model_id)).length;
+
   return {
     platform,
-    live_count: live.length,
-    to_add: live.filter(id => !known.has(id)),
-    to_disable: rows.filter(r => r.enabled === 1 && !liveSet.has(r.model_id)).map(r => r.model_id),
-    unchanged: rows.filter(r => liveSet.has(r.model_id)).length,
+    live_count: chatSet.size,
+    live_total: allSet.size,
+    add,
+    prune,
+    prune_active,
+    keep,
+    // aliases
+    to_add: add,
+    to_disable: prune_active,
+    unchanged: keep,
   };
 }
 
-// Read-only drift report (Дозор can call this without mutating anything)
+// Read-only drift report (Дозор can call this without mutating anything).
 catalogueRouter.get('/diff/:platform', async (req: Request, res: Response) => {
   try {
     res.json(await computeDiff(String(req.params.platform)));
@@ -100,10 +146,21 @@ catalogueRouter.get('/diff/:platform', async (req: Request, res: Response) => {
   }
 });
 
-// Apply: add live models (bottom rank), disable dead ones. Never deletes.
+// Sync. IVAN-GATED: mutates ONLY when ?apply=true. The default (apply absent or
+// apply=false) is a dry-run PROPOSAL — it returns the diff and changes nothing.
+// Apply = add live chat models (bottom rank), disable dead ones. Never deletes.
 catalogueRouter.post('/sync/:platform', async (req: Request, res: Response) => {
   try {
+    const applyRaw = (req.query.apply ?? (req.body && (req.body as { apply?: unknown }).apply));
+    const apply = applyRaw === true || applyRaw === 'true';
     const diff = await computeDiff(String(req.params.platform));
+
+    if (!apply) {
+      // Propose-only. Nothing is written. This is the DEFAULT.
+      res.json({ ...diff, applied: false, mode: 'propose' });
+      return;
+    }
+
     const db = getDb();
     const insert = db.prepare(
       `INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank)
@@ -112,12 +169,12 @@ catalogueRouter.post('/sync/:platform', async (req: Request, res: Response) => {
     const disable = db.prepare(
       'UPDATE models SET enabled = 0 WHERE platform = ? AND model_id = ?',
     );
-    const apply = db.transaction(() => {
-      for (const id of diff.to_add) insert.run(diff.platform, id, id);
-      for (const id of diff.to_disable) disable.run(diff.platform, id);
+    const applyTxn = db.transaction(() => {
+      for (const id of diff.add) insert.run(diff.platform, id, id);
+      for (const id of diff.prune_active) disable.run(diff.platform, id);
     });
-    apply();
-    res.json({ ...diff, applied: true });
+    applyTxn();
+    res.json({ ...diff, applied: true, mode: 'apply' });
   } catch (e) {
     res.status(502).json({ error: (e as Error).message });
   }
