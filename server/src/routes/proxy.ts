@@ -3,7 +3,7 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import type { ChatMessage } from '@freellmapi/shared/types.js';
-import { routeRequest, recordRateLimitHit, recordSuccess, STRONG_TIER, type RouteResult } from '../services/router.js';
+import { routeRequest, recordRateLimitHit, recordHardFailure, recordSuccess, STRONG_TIER, type RouteResult } from '../services/router.js';
 import { recordRequest, recordTokens, setCooldown } from '../services/ratelimit.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
 import { contentToString } from '../lib/content.js';
@@ -223,7 +223,31 @@ export function isRetryableError(err: any): boolean {
     // 404: model deprecated/removed upstream (e.g. OpenRouter's "no endpoints found"
     // for a model that's been pulled). Rotate to the next model in the chain —
     // setCooldown + the health checker will avoid this model on subsequent requests.
-    || msg.includes('404') || msg.includes('not found') || msg.includes('no endpoints found');
+    || msg.includes('404') || msg.includes('not found') || msg.includes('no endpoints found')
+    // Q-272 (2026-09-15): dead/forbidden catalogue entries must fall through, not 502.
+    // 410 Gone (NVIDIA retired llama-3.1-70b), 403 Forbidden (Mistral Large needs a paid tier
+    // for this key), 400 "model disabled/decommissioned/deprecated" (provider-side retirement).
+    // A malformed request is NOT retryable: 400 only counts with model-availability wording.
+    || msg.includes('410') || msg.includes('gone')
+    || msg.includes('403') || msg.includes('forbidden')
+    || isModelRetiredMessage(msg);
+}
+
+/** Provider says the MODEL is gone (not that our request is bad). */
+export function isModelRetiredMessage(msg: string): boolean {
+  const m = msg.toLowerCase();
+  const retired = m.includes('decommissioned') || m.includes('deprecated') || m.includes('disabled')
+    || m.includes('no longer') || m.includes('retired') || m.includes('does not exist') || m.includes('model_not_found');
+  return (m.includes('400') || m.includes('404') || m.includes('410')) && retired;
+}
+
+/** Cooldown length by failure class: dead model 6h, forbidden 1h, transient 2min. */
+export function cooldownForError(err: any): number {
+  const msg = (err.message ?? '').toLowerCase();
+  if (msg.includes('410') || msg.includes('gone') || msg.includes('404') || msg.includes('not found')
+      || msg.includes('no endpoints found') || isModelRetiredMessage(msg)) return 6 * 60 * 60_000;
+  if (msg.includes('403') || msg.includes('forbidden')) return 60 * 60_000;
+  return 120_000;
 }
 
 proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
@@ -456,8 +480,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         // Put this model+key on cooldown and try the next one
         const skipId = `${route.platform}:${route.modelId}:${route.keyId}`;
         skipKeys.add(skipId);
-        setCooldown(route.platform, route.modelId, route.keyId, 120_000);
-        recordRateLimitHit(route.modelDbId);
+        const cooldownMs = cooldownForError(err);
+        setCooldown(route.platform, route.modelId, route.keyId, cooldownMs);
+        // Q-272: a dead/forbidden model sinks to the bottom of the chain immediately, so the
+        // next request does not start from the same 410/403 (12-in-a-row was the symptom).
+        if (cooldownMs > 120_000) recordHardFailure(route.modelDbId); else recordRateLimitHit(route.modelDbId);
         lastError = err;
         console.log(`[Proxy] ${err.message.slice(0, 60)} from ${route.displayName}, falling back (attempt ${attempt + 1}/${MAX_RETRIES})`);
         continue;

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isRetryableError } from '../../routes/proxy.js';
+import { isRetryableError, cooldownForError } from '../../routes/proxy.js';
 
 describe('isRetryableError', () => {
   describe('413 Payload Too Large', () => {
@@ -48,9 +48,26 @@ describe('isRetryableError', () => {
 
     it('4xx auth/validation errors are NOT retryable', () => {
       expect(isRetryableError(new Error('401 Unauthorized'))).toBe(false);
-      expect(isRetryableError(new Error('403 Forbidden'))).toBe(false);
       expect(isRetryableError(new Error('400 Bad Request'))).toBe(false);
       expect(isRetryableError(new Error('Invalid API key'))).toBe(false);
+    });
+
+    // Q-272 (2026-09-15): in a multi-provider free pool a dead or tier-forbidden MODEL must
+    // fall through to the next provider instead of surfacing as 502 to the caller.
+    it('dead / forbidden catalogue entries ARE retryable (fall through the chain)', () => {
+      expect(isRetryableError(new Error('NVIDIA NIM API error 410: Gone'))).toBe(true);
+      expect(isRetryableError(new Error('Mistral API error 403: Forbidden'))).toBe(true);
+      expect(isRetryableError(new Error("400: Model 'llama3.1-8b' is disabled"))).toBe(true);
+      expect(isRetryableError(new Error('400 model has been decommissioned'))).toBe(true);
+      // a plain 400 with no model-availability wording is still a bad request
+      expect(isRetryableError(new Error('400 Bad Request: messages[0].content missing'))).toBe(false);
+    });
+
+    it('cooldown length follows the failure class', () => {
+      expect(cooldownForError(new Error('NVIDIA NIM API error 410: Gone'))).toBe(6 * 60 * 60_000);
+      expect(cooldownForError(new Error('OpenRouter API error 404: no endpoints found'))).toBe(6 * 60 * 60_000);
+      expect(cooldownForError(new Error('Mistral API error 403: Forbidden'))).toBe(60 * 60_000);
+      expect(cooldownForError(new Error('429 Too Many Requests'))).toBe(120_000);
     });
   });
 });

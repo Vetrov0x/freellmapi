@@ -70,6 +70,14 @@ export function recordRateLimitHit(modelDbId: number) {
 }
 
 /**
+ * Q-272: record a hard failure (model gone / forbidden) — max penalty at once, so the model
+ * sinks below every working one until the penalty decays (~20 min) or a success clears it.
+ */
+export function recordHardFailure(modelDbId: number) {
+  rateLimitPenalties.set(modelDbId, { count: (rateLimitPenalties.get(modelDbId)?.count ?? 0) + 1, lastHit: Date.now(), penalty: MAX_PENALTY });
+}
+
+/**
  * Record a success for a model — reduces its penalty so it rises back up.
  */
 export function recordSuccess(modelDbId: number) {
