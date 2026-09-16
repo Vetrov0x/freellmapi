@@ -50,6 +50,15 @@ register(new OpenAICompatProvider({
 }));
 
 // OpenRouter - OpenAI-compatible with extra headers
+// ClinePass (Q-410/Q-411, 2026-09-16): Cline's free model pass. OpenAI-compatible, but the
+// NON-streaming response is wrapped as {"data": {...choices...}} — unwrapped in openai-compat.ts.
+// Only cost-0 models are catalogued (qwen3.7-* bill gatewayCost>0 — deliberately excluded).
+register(new OpenAICompatProvider({
+  platform: 'clinepass',
+  name: 'ClinePass',
+  baseUrl: 'https://api.cline.bot/api/v1',
+}));
+
 register(new OpenAICompatProvider({
   platform: 'openrouter',
   name: 'OpenRouter',

@@ -68,7 +68,9 @@ export class OpenAICompatProvider extends BaseProvider {
       throw new Error(`${this.name} API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`);
     }
 
-    const data = await res.json() as ChatCompletionResponse;
+    let data = await res.json() as ChatCompletionResponse & { data?: ChatCompletionResponse };
+    // ClinePass wraps the completion as {"data": {...}} (Q-411); unwrap when the envelope is present.
+    if (!(data as any).choices && (data as any).data && (data as any).data.choices) data = (data as any).data;
     normalizeChoices(data);
     data._routed_via = { platform: this.platform, model: modelId };
     return data;

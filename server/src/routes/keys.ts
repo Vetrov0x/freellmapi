@@ -13,6 +13,7 @@ const PLATFORMS = [
   'google', 'groq', 'cerebras', 'sambanova', 'nvidia', 'mistral',
   'openrouter', 'github', 'cohere', 'cloudflare', 'zhipu', 'ollama',
   'kilo', 'pollinations', 'llm7',
+  'clinepass',
 ] as const;
 
 const addKeySchema = z.object({

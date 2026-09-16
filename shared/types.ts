@@ -4,8 +4,7 @@
 // server/src/routes/keys.ts PLATFORMS allowlist.
 // Hugging Face, Moonshot, and MiniMax direct integrations were dropped
 // in migrateModelsV4 (see server/src/db/index.ts).
-export type Platform =
-  | 'google'
+export type Platform = | 'google'
   | 'groq'
   | 'cerebras'
   | 'sambanova'
@@ -19,7 +18,8 @@ export type Platform =
   | 'ollama'
   | 'kilo'
   | 'pollinations'
-  | 'llm7';
+  | 'llm7'
+  | 'clinepass';
 
 export interface Model {
   id: number;
